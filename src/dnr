@@ -1,0 +1,930 @@
+#!/usr/bin/python2.7
+# -*- coding: UTF-8 -*-
+from __future__ import print_function, unicode_literals
+
+import argparse
+import collections
+import ctypes
+import datetime
+import errno
+import multiprocessing
+import os
+import io
+import re
+import os.path
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+import ConfigParser
+import json
+import yaml
+import urllib2
+from collections import namedtuple
+from errno import EINTR
+from fcntl import ioctl
+from Queue import Empty
+from termios import FIONREAD
+
+
+# enum
+class _EnumTypeMembers(object):
+    def __init__(self, values):
+        self._values = values
+
+    def values(self):
+        return self._values
+
+
+class _EnumTypeMeta(type):
+    def __new__(meta, name, bases, dct):
+        return super(_EnumTypeMeta, meta).__new__(meta, name, bases, dct)
+
+    def __init__(cls, name, bases, dct):
+        super(_EnumTypeMeta, cls).__init__(name, bases, dct)
+        vals = []
+        for k, v in dct.items():
+            if k.upper() != k or k.startswith('__'):
+                continue
+            vals.append(dct[k])
+        cls.__members__ = _EnumTypeMembers(vals)
+
+
+class _EnumType(object):
+    __metaclass__ = _EnumTypeMeta
+
+
+# inotify
+_fsencoding = sys.getfilesystemencoding()
+try:
+    import pathlib
+except ImportError:
+    _fsencode = lambda s: s.encode(_fsencoding)
+else:
+    # If the user passes a Path object it will be converted to bytes:
+    _fsencode = lambda s: bytes(s) if isinstance(s, pathlib.Path) else s.encode(_fsencoding)
+
+# And we will not decode bytestrings in inotify events, we will simply
+# give the user bytestrings back:
+_fsdecode = lambda s: s
+
+
+_libc = ctypes.cdll.LoadLibrary('libc.so.6')
+_libc.__errno_location.restype = ctypes.POINTER(ctypes.c_int)
+
+
+def _libc_call(function, *args):
+    """Wrapper which raises errors and retries on EINTR."""
+    while True:
+        rc = function(*args)
+        if rc == -1:
+            errno = _libc.__errno_location().contents.value
+            if errno  == EINTR:
+                # retry
+                continue
+            else:
+                raise OSError(errno, os.strerror(errno))
+        return rc
+
+
+class INotify(object):
+    def __init__(self):
+        """Object wrapper around ``inotify_init()`` which stores the inotify file
+        descriptor. Raises an OSError on failure. :func:`~inotify_simple.INotify.close`
+        should be called when no longer needed. Can be used as a context manager
+        to ensure it is closed."""
+        #: The inotify file descriptor returned by ``inotify_init()``. You are
+        #: free to use it directly with ``os.read`` if you'd prefer not to call
+        #: :func:`~inotify_simple.INotify.read` for some reason.
+        self.fd = _libc_call(_libc.inotify_init)
+        self._poller = select.poll()
+        self._poller.register(self.fd)
+
+    def add_watch(self, path, mask):
+        """Wrapper around ``inotify_add_watch()``. Returns the watch
+        descriptor or raises an OSError on failure.
+        Args:
+            path (py3 str or bytes, py2 unicode or str): The path to watch.
+                If ``str`` in python3 or ``unicode`` in python2, will be encoded with
+                the filesystem encoding before being passed to
+                ``inotify_add_watch()``. This method also accepts
+                ``pathlib.Path`` objects.
+            mask (int): The mask of events to watch for. Can be constructed by
+                bitwise-ORing :class:`~inotify_simple.flags` together.
+        Returns:
+            int: watch descriptor"""
+        if not isinstance(path, bytes):
+            path = _fsencode(path)
+        return _libc_call(_libc.inotify_add_watch, self.fd, path, mask)
+
+    def rm_watch(self, wd):
+        """Wrapper around ``inotify_rm_watch()``. Raises OSError on failure.
+        Args:
+            wd (int): The watch descriptor to remove"""
+        _libc_call(_libc.inotify_rm_watch, self.fd, wd)
+
+    def read(self, timeout=None, read_delay=None):
+        """Read the inotify file descriptor and return the resulting list of
+        :attr:`~inotify_simple.Event` namedtuples (wd, mask, cookie, name).
+        Args:
+            timeout (int): The time in milliseconds to wait for events if
+                there are none. If `negative or `None``, block until there are
+                events.
+            read_delay (int): The time in milliseconds to wait after the first
+                event arrives before reading the buffer. This allows further
+                events to accumulate before reading, which allows the kernel
+                to consolidate like events and can enhance performance when
+                there are many similar events.
+        Returns:
+            list: list of :attr:`~inotify_simple.Event` namedtuples"""
+        # Wait for the first event:
+        pending = self._poller.poll(timeout)
+        if not pending:
+            # Timed out, no events
+            return []
+        if read_delay is not None:
+            # Wait for more events to accumulate:
+            time.sleep(read_delay/1000.0)
+        # How much data is available to read?
+        bytes_avail = ctypes.c_int()
+        ioctl(self.fd, FIONREAD, bytes_avail)
+        buffer_size = bytes_avail.value
+        # Read and parse it:
+        data = os.read(self.fd, buffer_size)
+        events = parse_events(data)
+        return events
+
+    def close(self):
+        """Close the inotify file descriptor"""
+        os.close(self.fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+#: A ``namedtuple`` (wd, mask, cookie, name) for an inotify event.
+#: ``namedtuple`` objects are very lightweight to instantiate and access, whilst
+#: being human readable when printed, which is useful for debugging and
+#: logging. For best performance, note that element access by index is about
+#: four times faster than by name. Note: in Python 2, name is a bytestring,
+#: not a unicode string. In Python 3 it is a string decoded with ``os.fsdecode()``.
+Event = collections.namedtuple('Event', ['wd', 'mask', 'cookie', 'name'])
+
+_EVENT_STRUCT_FORMAT = 'iIII'
+_EVENT_STRUCT_SIZE = struct.calcsize(_EVENT_STRUCT_FORMAT)
+
+
+def parse_events(data):
+    """Parse data read from an inotify file descriptor into list of
+    :attr:`~inotify_simple.Event` namedtuples (wd, mask, cookie, name). This
+    function can be used if you have decided to call ``os.read()`` on the
+    inotify file descriptor yourself, instead of calling
+    :func:`~inotify_simple.INotify.read`.
+    Args:
+        data (bytes): A bytestring as read from an inotify file descriptor
+    Returns:
+        list: list of :attr:`~inotify_simple.Event` namedtuples"""
+    events = []
+    offset = 0
+    buffer_size = len(data)
+    while offset < buffer_size:
+        wd, mask, cookie, namesize = struct.unpack_from(_EVENT_STRUCT_FORMAT, data, offset)
+        offset += _EVENT_STRUCT_SIZE
+        name = _fsdecode(ctypes.c_buffer(data[offset:offset + namesize], namesize).value)
+        offset += namesize
+        events.append(Event(wd, mask, cookie, name))
+    return events
+
+
+class flags(_EnumType):
+    """Inotify flags as defined in ``inotify.h`` but with ``IN_`` prefix
+    omitted. Includes a convenience method for extracting flags from a mask.
+    """
+    ACCESS = 0x00000001  #: File was accessed
+    MODIFY = 0x00000002  #: File was modified
+    ATTRIB = 0x00000004  #: Metadata changed
+    CLOSE_WRITE = 0x00000008  #: Writable file was closed
+    CLOSE_NOWRITE = 0x00000010  #: Unwritable file closed
+    OPEN = 0x00000020  #: File was opened
+    MOVED_FROM = 0x00000040  #: File was moved from X
+    MOVED_TO  = 0x00000080  #: File was moved to Y
+    CREATE = 0x00000100  #: Subfile was created
+    DELETE = 0x00000200  #: Subfile was deleted
+    DELETE_SELF = 0x00000400  #: Self was deleted
+    MOVE_SELF = 0x00000800  #: Self was moved
+
+    UNMOUNT = 0x00002000  #: Backing fs was unmounted
+    Q_OVERFLOW = 0x00004000  #: Event queue overflowed
+    IGNORED = 0x00008000  #: File was ignored
+
+    ONLYDIR = 0x01000000  #: only watch the path if it is a directory
+    DONT_FOLLOW = 0x02000000  #: don't follow a sym link
+    EXCL_UNLINK = 0x04000000  #: exclude events on unlinked objects
+    MASK_ADD = 0x20000000  #: add to the mask of an already existing watch
+    ISDIR = 0x40000000  #: event occurred against dir
+    ONESHOT = 0x80000000  #: only send event once
+
+    @classmethod
+    def from_mask(cls, mask):
+        """Convenience method. Return a list of every flag in a mask."""
+        return [flag for flag in cls.__members__.values() if flag & mask]
+
+class masks(_EnumType):
+    """Convenience masks as defined in ``inotify.h`` but with ``IN_`` prefix
+    omitted."""
+    #: helper event mask equal to ``flags.CLOSE_WRITE | flags.CLOSE_NOWRITE``
+    CLOSE = (flags.CLOSE_WRITE | flags.CLOSE_NOWRITE)
+    #: helper event mask equal to ``flags.MOVED_FROM | flags.MOVED_TO``
+    MOVE = (flags.MOVED_FROM | flags.MOVED_TO)
+
+    #: bitwise-OR of all the events that can be passed to
+    #: :func:`~inotify_simple.INotify.add_watch`
+    ALL_EVENTS  = (flags.ACCESS | flags.MODIFY | flags.ATTRIB | flags.CLOSE_WRITE |
+                   flags.CLOSE_NOWRITE | flags.OPEN | flags.MOVED_FROM |
+                   flags.MOVED_TO | flags.DELETE | flags.CREATE | flags.DELETE_SELF |
+                   flags.MOVE_SELF)
+
+
+# unbuffered
+class Unbuffered(object):
+    """Usage: sys.stdout = Unbuffered(sys.stdout)"""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+
+    def writelines(self, datas):
+        self.stream.writelines(datas)
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+
+# colors
+ANSI_COLORS = [
+    'grey',
+    'red',
+    'green',
+    'yellow',
+    'blue',
+    'magenta',
+    'cyan',
+    'white'
+]
+
+for i, name in enumerate(ANSI_COLORS):
+    globals()[name] = str(30 + i)
+    globals()['intense_' + name] = str(30 + i) + ';1'
+
+
+def get_colors():
+    cs = ['cyan', 'yellow', 'green', 'magenta', 'red', 'blue',
+          'intense_cyan', 'intense_yellow', 'intense_green',
+          'intense_magenta', 'intense_red', 'intense_blue']
+    cs = [globals()[c] for c in cs]
+
+    i = 0
+    while True:
+        yield cs[i % len(cs)]
+        i += 1
+
+
+# utils
+def iteritems(data):
+    return data.iteritems()
+
+
+# env
+class Env(object):
+
+    def now(self):
+        return datetime.datetime.now()
+
+    def terminate(self, pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError as e:
+            if e.errno not in [errno.EPERM, errno.ESRCH]:
+                raise
+
+    def kill(self, pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError as e:
+            if e.errno not in [errno.EPERM, errno.ESRCH]:
+                raise
+
+
+# process
+class Process(object):
+    """
+    A simple utility wrapper around a subprocess.Popen that stores
+    a number of attributes needed by Honcho and supports forwarding process
+    lifecycle events and output to a queue.
+    """
+    def __init__(self,
+                 cmd,
+                 name=None,
+                 color=None,
+                 quiet=False,
+                 env=None,
+                 cwd=None):
+        self.cmd = cmd
+        self.color = color
+        self.quiet = quiet
+        self.name = name
+        self.env = os.environ.copy() if env is None else env
+        self.cwd = cwd
+
+        # This is a honcho.environ.Env object, to allow for stubbing of
+        # external calls, not the operating system environment.
+        self._env = Env()
+        self._child = None
+        self._child_ctor = Popen
+
+    def run(self, events=None, ignore_signals=False):
+        self._events = events
+        self._child = self._child_ctor(self.cmd, env=self.env, cwd=self.cwd)
+        self._send_message({'pid': self._child.pid}, type='start')
+
+        # Don't pay attention to SIGINT/SIGTERM. The process itself is
+        # considered unkillable, and will only exit when its child (the shell
+        # running the Procfile process) exits.
+        if ignore_signals:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+        for line in iter(self._child.stdout.readline, b''):
+            if not self.quiet:
+                self._send_message(line)
+        self._child.stdout.close()
+        self._child.wait()
+
+        self._send_message({'returncode': self._child.returncode}, type='stop')
+
+    def _send_message(self, data, type='line'):
+        if self._events is not None:
+            self._events.put(Message(type=type,
+                                     data=data,
+                                     time=self._env.now(),
+                                     name=self.name,
+                                     color=self.color))
+
+
+class Popen(subprocess.Popen):
+
+    def __init__(self, cmd, **kwargs):
+        start_new_session = kwargs.pop('start_new_session', True)
+        options = {
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.STDOUT,
+            'shell': True,
+            'bufsize': 1,
+            'close_fds': True,
+        }
+        options.update(**kwargs)
+        if start_new_session:
+            if sys.version_info < (3, 2):
+                options.update(preexec_fn=os.setsid)
+            else:
+                options.update(start_new_session=True)
+        super(Popen, self).__init__(cmd, **options)
+
+
+# printer
+Message = namedtuple("Message", "type data time name color")
+
+
+class Printer(object):
+    """
+    Printer is where Honcho's user-visible output is defined. A Printer
+    instance receives typed messages and prints them to its output (usually
+    STDOUT) in the Honcho format.
+    """
+
+    def __init__(self,
+                 output=sys.stdout,
+                 time_format="%H:%M:%S",
+                 width=0,
+                 color=True,
+                 prefix=True):
+        self.output = output
+        self.time_format = time_format
+        self.width = width
+        self.color = color
+        self.prefix = prefix
+
+        try:
+            # We only want to print colored messages if the given output supports
+            # ANSI escape sequences. Usually, testing if it is a TTY is safe enough.
+            self._colors_supported = self.output.isatty()
+        except AttributeError:
+            # If the given output does not implement isatty(), we assume that it
+            # is not able to handle ANSI escape sequences.
+            self._colors_supported = False
+
+    def write(self, message):
+        if message.type != 'line':
+            raise RuntimeError('Printer can only process messages of type "line"')
+
+        name = message.name if message.name is not None else ""
+        name = name.ljust(self.width)
+        if name:
+            name += " "
+
+        # When encountering data that cannot be interpreted as UTF-8 encoded
+        # Unicode, Printer will replace the unrecognisable bytes with the
+        # Unicode replacement character (U+FFFD).
+        if isinstance(message.data, bytes):
+            string = message.data.decode('utf-8', 'replace')
+        elif type(message.data) == unicode or type(message.data) == str:
+            string = message.data
+        else:
+            string = message.data.decode('utf-8', 'replace')
+        output = unicode(string)
+        try:
+            sys.stderr.write(output.encode('utf-8'))
+        except:
+            sys.stderr.write(output.encode('ascii', 'replace'))
+
+
+def _ansi(code):
+    return '\033[{0}m'.format(code)
+
+
+def _color_string(color, s):
+    return '{0}{1}{2}{3}'.format(_ansi(0), _ansi(color), s, _ansi(0))
+
+
+# proc_manager
+KILL_WAIT = 5
+SIGNALS = {
+    signal.SIGINT: {
+        'name': 'SIGINT',
+        'rc': 130,
+    },
+    signal.SIGTERM: {
+        'name': 'SIGTERM',
+        'rc': 143,
+    },
+}
+SYSTEM_PRINTER_NAME = 'dnr'
+
+
+class Manager(object):
+    """
+    Manager is responsible for running multiple external processes in parallel
+    managing the events that result (starting, stopping, printing). By default
+    it relays printed lines to a printer that prints to STDOUT.
+
+    Example::
+
+        import sys
+        from honcho.manager import Manager
+
+        m = Manager()
+        m.add_process('server', 'ruby server.rb')
+        m.add_process('worker', 'python worker.py')
+        m.loop()
+
+        sys.exit(m.returncode)
+    """
+
+    #: After :func:`~honcho.manager.Manager.loop` finishes,
+    #: this will contain a return code that can be used with `sys.exit`.
+    returncode = None
+
+    def __init__(self, printer):
+        self.events = multiprocessing.Queue()
+        self.returncode = None
+        self._colors = get_colors()
+        self._env = Env()
+        self._printer = printer
+        self._process_ctor = Process
+        self._processes = {}
+        self._exit_start = None
+        self._terminating = False
+
+    def add_process(self, name, cmd, quiet=False, env=None, cwd=None):
+        """
+        Add a process to this manager instance. The process will not be started
+        until :func:`~honcho.manager.Manager.loop` is called.
+        """
+        assert name not in self._processes, "process names must be unique"
+        proc = self._process_ctor(cmd,
+                                  name=name,
+                                  quiet=quiet,
+                                  color=next(self._colors),
+                                  env=env,
+                                  cwd=cwd)
+        self._processes[name] = {}
+        self._processes[name]['obj'] = proc
+
+        # Update printer width to accommodate this process name
+        self._printer.width = max(self._printer.width, len(name))
+
+        return proc
+
+    def loop(self):
+        """
+        Start all the added processes and multiplex their output onto the bound
+        printer (which by default will print to STDOUT).
+
+        If one process terminates, all the others will be terminated by
+        Honcho, and :func:`~honcho.manager.Manager.loop` will return.
+
+        This method will block until all the processes have terminated.
+        """
+        def _terminate(signum, frame):
+            self._system_print("%s received\n" % SIGNALS[signum]['name'])
+            self.returncode = SIGNALS[signum]['rc']
+            self.terminate()
+
+        signal.signal(signal.SIGTERM, _terminate)
+        signal.signal(signal.SIGINT, _terminate)
+
+        self._start()
+
+        exit = False
+        while True:
+            try:
+                msg = self.events.get(timeout=0.05)
+            except Empty:
+                if exit:
+                    break
+            else:
+                if msg.type == 'line':
+                    self._printer.write(msg)
+                elif msg.type == 'start':
+                    self._processes[msg.name]['pid'] = msg.data['pid']
+                    self._system_print("%s started (pid=%s)\n" % (msg.name, msg.data['pid']))
+                elif msg.type == 'stop':
+                    self._processes[msg.name]['returncode'] = msg.data['returncode']
+                    self._system_print("%s stopped (rc=%s)\n" % (msg.name, msg.data['returncode']))
+                    if self.returncode is None:
+                        self.returncode = msg.data['returncode']
+
+            if self._all_started() and self._all_stopped():
+                exit = True
+
+            if self._exit_start is None and self._all_started() and self._any_stopped():
+                self.terminate()
+
+            if self._exit_start is not None:
+                # If we've been in this loop for more than KILL_WAIT seconds,
+                # it's time to kill all remaining children.
+                waiting = self._env.now() - self._exit_start
+                if waiting > datetime.timedelta(seconds=KILL_WAIT):
+                    self.kill()
+
+    def terminate(self):
+        """Terminate all processes managed by this process Manager."""
+        if self._terminating:
+            return
+        self._exit_start = self._env.now()
+        self._terminating = True
+        self._killall()
+
+    def kill(self):
+        """Kill all processes managed by this process Manager."""
+        self._killall(force=True)
+
+    def _killall(self, force=False):
+        """Kill all remaining processes, forcefully if requested."""
+        for_termination = []
+
+        for n, p in iteritems(self._processes):
+            if 'returncode' not in p:
+                for_termination.append(n)
+
+        for n in for_termination:
+            p = self._processes[n]
+            signame = 'SIGKILL' if force else 'SIGTERM'
+            self._system_print("sending %s to %s (pid %s)\n" %
+                               (signame, n, p['pid']))
+            if force:
+                self._env.kill(p['pid'])
+            else:
+                self._env.terminate(p['pid'])
+
+    def _start(self):
+        for name, p in self._processes.items():
+            p['process'] = multiprocessing.Process(name=name,
+                                                   target=p['obj'].run,
+                                                   args=(self.events, True))
+            p['process'].start()
+
+    def _all_started(self):
+        return all(p.get('pid') is not None for _, p in iteritems(self._processes))
+
+    def _all_stopped(self):
+        return all(p.get('returncode') is not None for _, p in iteritems(self._processes))
+
+    def _any_stopped(self):
+        return any(p.get('returncode') is not None for _, p in iteritems(self._processes))
+
+    def _system_print(self, data):
+        self._printer.write(Message(type='line',
+                                    data=data,
+                                    time=self._env.now(),
+                                    name=SYSTEM_PRINTER_NAME,
+                                    color=None))
+
+
+# main
+def print_usage():
+    usage = """Usage: dnr [OPTIONS]... DIRECTORY
+
+OPTIONS:
+  --env=path      [TBD] Specify your own environment file, default is `./dnr.env`.
+  --build         [TBD] Building the project prior to running. By default, the project will not be built.
+  --restore       [TBD] Restore nuget pagackes.
+"""
+    print(usage)
+
+
+def discover_env_config(env_path, path):
+    if env_path == '':
+        return None
+
+    if env_path is not None:
+        abs_path = os.path.abspath(env_path)
+        if os.path.isfile(abs_path) and os.path.exists(abs_path):
+            return abs_path
+        print('dnr: error: env file %s does not exists.' % abs_path)
+        sys.exit(1)
+
+    if path == '/':
+        return None
+
+    fn = path + '/dnr.env'
+    if os.path.isfile(fn) and os.path.exists(fn):
+        return fn
+
+    return discover_env_config(None, os.path.abspath(os.path.join(path, os.pardir)))
+
+
+def discover_env_path(cs_proj_dir_path):
+    launch_settings_path = os.path.join(cs_proj_dir_path, 'Properties/launchSettings.json')
+    if os.path.isfile(launch_settings_path) and os.path.exists(launch_settings_path):
+        return launch_settings_path
+    return None
+
+
+def discover_latest_netcoreapp(path):
+    """`path` should point to the directory containing `netcoreapp2*` directory, usually it is .../bin/Debug/"""
+    for x in ['netcoreapp2.2', 'netcoreapp2.1', 'netcoreapp2.0']:
+        if os.path.exists(os.path.join(path, x)):
+            return x
+    return 'netcoreapp2.0'
+
+
+def parse_bool(value):
+    v = ('%s' % value).strip().lower()
+    return True if v in ['1', 'true'] else False
+
+
+def shadow_clean(path):
+    for x in os.listdir(path):
+        if re.match(r'netcoreapp\d\.\d-sc\d+', x):
+            dir_path = os.path.join(path, x)
+            shutil.rmtree(dir_path)
+
+
+def once(fn):
+    d = {}
+    no_value = object()
+
+    def w(*args):
+        k = unicode(args)
+        v = d.get(k, no_value)
+        if v is no_value:
+            v = fn(*args)
+            d[k] = v
+        return v
+
+    return w
+
+
+@once
+def vault_token():
+    ls = [os.path.join(os.environ['HOME'], '.vault-token'), '/.vault-token', '/root/.vault-token']
+    for p in ls:
+        try:
+            with io.open(p) as f:
+                return f.read()
+        except:
+            pass
+    print('dnr: error: no vault token found.')
+    sys.exit(1)
+
+
+@once
+def vault_read(path):
+    try:
+        url_base = os.environ.get('VAULT_ADDR', 'http://localhost:8200').strip('/')
+        url = '{}/v1/secret/{}'.format(url_base, path)
+        print('Reading "{}" key...'.format(url))
+        headers = { 'Content-type': 'application/json', 'Accept': 'application/json', 'X-Vault-Token': vault_token() }
+        req = urllib2.Request(url=url, headers=headers)
+        response = urllib2.urlopen(req)
+        raw_content = response.read()
+        content = json.loads(raw_content)
+        doc = content['data']
+        return doc
+    except Exception as e:
+        print('dnr: error: failed to read "{}". {}: {}'.format(path, type(e).__name__, e))
+        sys.exit(1)
+
+
+@once
+def vault(path):
+    parts = path.split('/')
+    root_key = '/'.join(parts[:-1])
+    doc_key = parts[-1]
+    doc = vault_read(root_key)
+    return doc.get(doc_key, '')
+
+
+def compile_val(val):
+    def sub_expr(match):
+        fname = match.group(1)
+        arg = match.group(2)
+        fns = {'vault': vault}
+        f = fns.get(fname, None)
+        if f is None:
+            raise Exception('Function "%s" is not defined' % fname)
+        return unicode(vault(arg))
+
+    expr_pat = r"<%=\s*(\w+)\('(.+?)'\)\s*%>"
+    res = re.sub(expr_pat, sub_expr, val)
+    return res
+
+
+def main():
+    """
+    This tiny program is to launch dotnet programs. It discovers dnr.env file and merges
+    it with the key/value pairs from the launchSettings.json
+    """
+    sys.stdout = Unbuffered(sys.stdout)
+    sys.stderr = Unbuffered(sys.stderr)
+
+    argv = sys.argv
+    args_env_path = None
+    args_shadow = parse_bool(os.getenv('DNR_SHADOW', False))
+    args_build = False
+    args_restore = False
+    argv = list()
+    for val in [x for x in sys.argv[1:]]:
+        if not val.startswith('-'):
+            argv.append(val)
+        if val.startswith('--env'):
+            args_env_path = val.split('=')[1]
+        elif val == '--shadow':
+            args_shadow = True
+        elif val == '--build':
+            args_build = True
+        elif val == '--restore':
+            args_restore = True
+        elif val.startswith('-'):
+            print('dnr: error: unexpected option: "{0}"'.format(val))
+            sys.exit(1)
+
+    if len(argv) < 1:
+        print_usage()
+        sys.exit(0)
+
+    # validate project directory
+    cs_proj_dir_path = os.path.abspath(argv[0])
+    if not os.path.isdir(cs_proj_dir_path) or not os.path.exists(cs_proj_dir_path):
+        print('dnr: error: "{0}" is not directory or does not exists'.format(argv[0]))
+        sys.exit(0)
+
+    dll_name = os.path.basename(cs_proj_dir_path)
+    dll_filename = dll_name + '.dll'
+    netcoreapp = discover_latest_netcoreapp(os.path.join(cs_proj_dir_path, 'bin/Debug/'))
+    dll_path = os.path.join(cs_proj_dir_path, 'bin/Debug/%s' % netcoreapp, dll_filename)
+    if not os.path.isfile(dll_path):
+        print('dnr: error: cound not find {0} file'.format(dll_path))
+        sys.exit(0)
+
+    env_vars = {}
+
+    # parse launchSettings.json
+    ls_vars = {}
+    launch_settings_path = discover_env_path(cs_proj_dir_path)
+    if launch_settings_path is None:
+        print('dnr: could not find launchSettings.json, no enviroment variables will be set')
+    else:
+        with io.open(launch_settings_path) as f:
+            try:
+                json_text = '\n'.join([x for x in f.readlines() if x.strip() != '' and not x.strip().startswith('//') ])
+                launch_settings = json.loads(json_text)
+            except:
+                print('dnr: error: failed to parse {} file.'.format(launch_settings_path))
+                raise
+            profiles = launch_settings.get('profiles', {})
+            if dll_name not in profiles:
+                print('dnr: launchSettings.json has not "{0}" profile.'.format(dll_name))
+            profile = profiles.get(dll_name, {})
+            env_vars = profile.get('environmentVariables', {})
+            if 'applicationUrl' in profile:
+                env_vars['ASPNETCORE_URLS'] =  profile['applicationUrl']
+            if os.environ.get('ASPNETCORE_URLS', None) is not None:
+                env_vars['ASPNETCORE_URLS'] = os.environ['ASPNETCORE_URLS']
+            ls_vars.update(env_vars)
+
+    # parse dnr.env
+    dnr_vars = {'global': {}}
+    env_config_path = discover_env_config(args_env_path, cs_proj_dir_path)
+    if env_config_path is None:
+        print('dnr: could not find dnr.env file, it will use values specified in the launchSettings.json')
+    else:
+        with io.open(env_config_path) as f:
+            content = f.readlines()
+            content.append(u'\n')
+        re_kv = re.compile(r'^\s*(.+?)\s+((\"?)(?(3)(.+)\")|[^#]+)')
+        re_section = re.compile(r'^\[(.+)\]\s*')
+        has_error = False
+        current_section = None
+        for l, i in zip([l.strip() for l in content], range(1, len(content))):
+            if len(l) == 0:
+                continue
+            if l.startswith('#'):
+                continue
+            msection = re_section.match(l)
+            if msection is not None:
+                current_section = msection.group(1)
+                continue
+            mkv = re_kv.match(l)
+            if mkv is None:
+                has_error = True
+                print('dnr: error: file contains parsing errors:\n  line %d: %s' % (i, l[0: 80]))
+                continue
+            if current_section is None and mkv is not None:
+                has_error = True
+                print('dnr: error: file contains section parsing errors:\n  line %d: %s' % (i, l[0: 80]))
+                sys.exit(1)
+            k, v = mkv.group(1).strip(), mkv.group(2).strip()
+            section_dict = dnr_vars.get(current_section, {})
+            section_dict[k] = compile_val(v)
+            dnr_vars[current_section] = section_dict
+
+        if has_error:
+            sys.exit(1)
+
+    # update dnr_vars to make unions of global an other sections
+    for _, sec_dict in dnr_vars.items():
+         glob_dict = dnr_vars['global'].copy()
+         glob_dict.update(sec_dict)
+         sec_dict.update(glob_dict)
+
+    printer = Printer(sys.stdout)
+    printer.width = len(SYSTEM_PRINTER_NAME)
+
+    # make env dict
+    env = os.environ.copy()
+    final_vars = {}
+    final_vars.update(ls_vars)
+    final_vars.update(dnr_vars.get('global'))
+    final_vars.update(dnr_vars.get(dll_name, {}))
+    dump_vars = 'Configuration variables:'
+    for k, v in sorted(ls_vars.items()):
+        sk, sv = str(k), str(final_vars[k]).strip('"')
+        sv_short = sv.split('\n')[0] if '\n' in sv else sv
+        dump_vars += '\n  - {0} = {1}'.format(sk, sv_short)
+        env[sk.replace(":", "__")] = sv
+    dump_vars += '\n'
+    printer.write(Message(type='line', data=dump_vars, time=Env().now(), name=SYSTEM_PRINTER_NAME, color=None))
+
+    # apply shadow argument
+    if args_shadow:
+        src_netcoreapp_dir_path = os.path.abspath(os.path.join(dll_path, '..'))
+        dst_netcoreapp_dir_path = src_netcoreapp_dir_path + ('-sc%s' % int(time.time()))
+        shutil.copytree(src_netcoreapp_dir_path + '/', dst_netcoreapp_dir_path + '/')
+        final_dll_path = os.path.join(dst_netcoreapp_dir_path, dll_filename)
+    else:
+        final_dll_path = dll_path
+
+    # launch program
+    m = Manager(printer)
+    m.add_process(dll_filename, '/usr/share/dotnet/dotnet ' + final_dll_path, env=env, cwd=cs_proj_dir_path)
+    m.loop()
+
+    # cleanups
+    shadow_clean(os.path.join(cs_proj_dir_path, 'bin/Debug/'))
+
+    sys.exit(m.returncode)
+
+
+if __name__ == "__main__":
+    main()

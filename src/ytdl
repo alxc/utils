@@ -1,0 +1,14 @@
+#!/bin/bash
+YTDL="$(which youtube-dl)"
+if [[ $YTDL == "" ]]; then
+    echo "ytdl: please install youtube-dl first:"
+    echo "pip install youtube-dl --user && sudo apt-get install ffmpeg -y"
+    exit 1
+fi
+if [[ $1 == "" ]]; then
+    echo "Usage:"
+    echo "ytdl https://www.youtube.com/watch?v=IU1qbMyq_CE"
+    exit 0
+fi
+mkdir -p $HOME/Share
+cd $HOME/Share && $YTDL --extract-audio --audio-format mp3 --audio-quality=0 $1

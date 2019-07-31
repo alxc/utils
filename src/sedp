@@ -1,0 +1,11 @@
+#!/usr/bin/perl
+# usage: echo 'total: 123 unit' | ./sedp 's/.*total: (\d+).+/\1/g'
+my $rcs = "@ARGV[0]";
+my $regex = undef;
+my $cmd = substr $rcs, 0, 2;
+die "'$cmd' is invalid command." if ($cmd cmp "s/");
+foreach my $line (<STDIN>) {
+    $line =~ s/\\/\\\\/g;
+    my $ps = "my \$ns = '" . $line . "'; \$ns =~ $rcs; print \$ns;";
+    eval $ps;
+}

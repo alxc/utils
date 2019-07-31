@@ -1,0 +1,216 @@
+#!/usr/bin/python2.7 -u
+# -*- coding: UTF-8 -*-
+from __future__ import print_function, unicode_literals
+
+import sys
+import json
+import colorama
+from honcho.manager import Manager
+
+
+EXCLUDE = ['assemblyName', 'globalContext', 'callTime', 'logRoute', 'sourceContext']
+DUMP_TO_FILE = False
+COLORED = True and not DUMP_TO_FILE
+MAX_COLS = 240
+
+
+class Unbuffered(object):
+    """Usage: sys.stdout = Unbuffered(sys.stdout)"""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+
+    def writelines(self, datas):
+        self.stream.writelines(datas)
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+
+def colored(color):
+    """
+    BLACK           = 30
+    RED             = 31
+    GREEN           = 32
+    YELLOW          = 33
+    BLUE            = 34
+    MAGENTA         = 35
+    CYAN            = 36
+    WHITE           = 37
+    RESET           = 39
+    LIGHTBLACK_EX   = 90
+    LIGHTRED_EX     = 91
+    LIGHTGREEN_EX   = 92
+    LIGHTYELLOW_EX  = 93
+    LIGHTBLUE_EX    = 94
+    LIGHTMAGENTA_EX = 95
+    LIGHTCYAN_EX    = 96
+    LIGHTWHITE_EX   = 97
+    """
+
+    def fn(raw):
+        text = unicode(raw)
+        fore = '' if color is None else getattr(colorama.Fore, color.upper(), colorama.Fore.RESET)
+        return fore + (text or '') + colorama.Style.RESET_ALL
+
+    if COLORED:
+        return fn
+    
+    return unicode
+
+
+levels = {
+    'critical': 'C',
+    'error': 'E',
+    'warning': 'W',
+    'information': 'I',
+    'debug': 'D',
+    'trace': 'T',
+    '(nil)': '(nil)'
+}
+level_clr = {
+    'critical': colored('LIGHTRED_EX'),
+    'error': colored('red'),
+    'warning': colored('LIGHTYELLOW_EX'),
+    'information': colored('LIGHTBLUE_EX'),
+    'debug': colored('LIGHTGREEN_EX'),
+    'trace': colored('cyan'),
+    '(nil)': colored(None)
+}
+dark_gray = colored('LIGHTBLACK_EX')
+light_yellow = colored('LIGHTYELLOW_EX')
+light_magenta = colored('LIGHTMAGENTA_EX')
+light_cyan = colored('LIGHTCYAN_EX')
+light_blue = colored('LIGHTBLUE_EX')
+field_color = light_blue
+str_color = light_yellow
+
+
+F_MESSAGE = 'message'
+F_LEVEL = 'level'
+F_EXCEPTION = 'exception'
+F_EXCEPTIONS = 'exceptions'
+F_SOURCE_CONTEXT = 'sourceContext'
+
+
+def render_exception(x):
+    if type(x) != dict:
+        return unicode(x)
+    s = ''
+    s += ' * exception: %s\n' % (x.get('message', '(nil)'), )
+    s += '   - type: %s\n' % (x.get('type', '(nil)'), )
+    s += '   - stackTrace:\n%s\n'  % (x.get('stackTrace','(nil)'), )
+    return s
+
+
+def render_exceptions(xs):
+    if type(xs) != list:
+        return unicode(xs)
+    s = ''
+    for d in xs:
+        s += render_exception(d['exception'])
+    return s
+
+
+def render_multiline(level, x):
+    b, f = '', levels[level]
+    for l in x.splitlines():
+        b += level_clr[level](f) + dark_gray('|') + l + '\n'
+        f = '|'
+    return b
+
+
+def render_string(string):
+    #return string
+    try:
+        dct = json.loads(string)  # type: dict
+    except:
+        dct = None
+    if type(dct) is not dict:
+        return dark_gray('||') + string
+    d = dct.copy()
+    if F_MESSAGE in d: del d[F_MESSAGE]
+    if F_LEVEL in d: del d[F_LEVEL]
+    if F_EXCEPTION in d: del d[F_EXCEPTION]
+    if F_EXCEPTIONS in d: del d[F_EXCEPTIONS]
+    [d.pop(k, None) for k in EXCLUDE]
+    level = dct.get(F_LEVEL, '(nil)').lower()
+    message = dct.get(F_MESSAGE, '(nil:message)').strip()
+    b = (level_clr[level](message) + ' ' + dark_gray(dct.get(F_SOURCE_CONTEXT, ''))).strip() + '\n'
+    if F_EXCEPTION in dct:
+        b += render_exception(dct[F_EXCEPTION])
+    if F_EXCEPTIONS in dct:
+        b += render_exceptions(dct[F_EXCEPTIONS])
+    fields = ''   
+    ml_fields = ''   
+    for k, v in sorted(d.iteritems()):
+        tv = type(v)
+        if tv in [unicode, str] and '\n' in v:
+            ml_fields += field_color(k) + dark_gray(':') + ' ' + dark_gray('```') + '\n'
+            for l in v.splitlines():
+                ml_fields += str_color(l) + '\n'
+            ml_fields += dark_gray('```') + '\n'
+        else:
+            if v is None:
+                cv = light_blue('null')
+            elif tv in [unicode, str]:
+                cv = light_yellow('\'' + v + '\'')
+            elif tv in [int, float, bool]:
+                cv = light_cyan(v)
+            elif tv == dict:
+                cv = json.dumps(v)
+            elif tv == list:
+                cv = json.dumps(v)
+            else: 
+                cv = unicode(v)
+            l = field_color(k) + dark_gray(':')
+            fields += l + ' ' + cv + ' '
+    if fields != '':
+        b += '  ' + fields
+    if ml_fields != '':
+        b += '\n' + ml_fields
+    return render_multiline(level, b)
+
+
+class Printer():
+    def __init__(self, output=sys.stdout, **kwargs):
+        self.output = output
+
+    def write(self, message):
+        if message.name == 'system':
+            return
+        if isinstance(message.data, bytes) or type(message.data) == str:
+            string = message.data.decode("utf-8", "replace")
+        else:
+            string = message.data
+        text = render_string(string)
+        encoded = (text.rstrip() + '\n').encode('utf-8', 'replace')
+        if not COLORED:
+            import io, fcntl
+            with io.open('/tmp/pretty.out', 'ab') as fd:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                fd.write(encoded)
+                self.output.write(encoded)
+        else:
+            self.output.write(encoded)
+
+
+def main():
+    if sys.argv[1:] == []:
+        return 0
+    sys.stdout = Unbuffered(sys.stdout)
+    sys.stderr = Unbuffered(sys.stderr)
+    colorama.init()
+    m = Manager(Printer())
+    cmd = ' '.join(sys.argv[1:])
+    m.add_process('pretty `%s`' % cmd, cmd)
+    m.loop()
+    return m.returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)

@@ -1,0 +1,842 @@
+#!/usr/bin/python2.7
+# -*- coding: UTF-8 -*-
+from __future__ import print_function, unicode_literals
+
+import argparse
+import collections
+import ctypes
+import datetime
+import errno
+import multiprocessing
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+from collections import namedtuple
+from errno import EINTR
+from fcntl import ioctl
+from Queue import Empty
+from termios import FIONREAD
+
+"""
+Usage:
+    $ restch PATTERN [OPTIONS] -- COMMAND
+"""
+
+# enum
+class _EnumTypeMembers(object):
+    def __init__(self, values):
+        self._values = values
+
+    def values(self):
+        return self._values
+
+
+class _EnumTypeMeta(type):
+    def __new__(meta, name, bases, dct):
+        return super(_EnumTypeMeta, meta).__new__(meta, name, bases, dct)
+
+    def __init__(cls, name, bases, dct):
+        super(_EnumTypeMeta, cls).__init__(name, bases, dct)
+        vals = []
+        for k, v in dct.items():
+            if k.upper() != k or k.startswith('__'):
+                continue
+            vals.append(dct[k])
+        cls.__members__ = _EnumTypeMembers(vals)
+
+
+class _EnumType(object):
+    __metaclass__ = _EnumTypeMeta
+
+
+# inotify
+_fsencoding = sys.getfilesystemencoding()
+try:
+    import pathlib
+except ImportError:
+    _fsencode = lambda s: s.encode(_fsencoding)
+else:
+    # If the user passes a Path object it will be converted to bytes:
+    _fsencode = lambda s: bytes(s) if isinstance(s, pathlib.Path) else s.encode(_fsencoding)
+    
+# And we will not decode bytestrings in inotify events, we will simply
+# give the user bytestrings back:
+_fsdecode = lambda s: s
+
+
+_libc = ctypes.cdll.LoadLibrary('libc.so.6')
+_libc.__errno_location.restype = ctypes.POINTER(ctypes.c_int)
+
+
+def _libc_call(function, *args):
+    """Wrapper which raises errors and retries on EINTR."""
+    while True:
+        rc = function(*args)
+        if rc == -1:
+            errno = _libc.__errno_location().contents.value
+            if errno  == EINTR:
+                # retry
+                continue
+            else:
+                raise OSError(errno, os.strerror(errno))
+        return rc
+
+
+class INotify(object):
+    def __init__(self):
+        """Object wrapper around ``inotify_init()`` which stores the inotify file
+        descriptor. Raises an OSError on failure. :func:`~inotify_simple.INotify.close`
+        should be called when no longer needed. Can be used as a context manager
+        to ensure it is closed."""
+        #: The inotify file descriptor returned by ``inotify_init()``. You are
+        #: free to use it directly with ``os.read`` if you'd prefer not to call
+        #: :func:`~inotify_simple.INotify.read` for some reason.
+        self.fd = _libc_call(_libc.inotify_init)
+        self._poller = select.poll()
+        self._poller.register(self.fd)
+
+    def add_watch(self, path, mask):
+        """Wrapper around ``inotify_add_watch()``. Returns the watch
+        descriptor or raises an OSError on failure.
+        Args:
+            path (py3 str or bytes, py2 unicode or str): The path to watch.
+                If ``str`` in python3 or ``unicode`` in python2, will be encoded with
+                the filesystem encoding before being passed to
+                ``inotify_add_watch()``. This method also accepts
+                ``pathlib.Path`` objects.
+            mask (int): The mask of events to watch for. Can be constructed by
+                bitwise-ORing :class:`~inotify_simple.flags` together.
+        Returns:
+            int: watch descriptor"""
+        if not isinstance(path, bytes):
+            path = _fsencode(path)
+        return _libc_call(_libc.inotify_add_watch, self.fd, path, mask)
+
+    def rm_watch(self, wd):
+        """Wrapper around ``inotify_rm_watch()``. Raises OSError on failure.
+        Args:
+            wd (int): The watch descriptor to remove"""
+        _libc_call(_libc.inotify_rm_watch, self.fd, wd)
+
+    def read(self, timeout=None, read_delay=None):
+        """Read the inotify file descriptor and return the resulting list of
+        :attr:`~inotify_simple.Event` namedtuples (wd, mask, cookie, name).
+        Args:
+            timeout (int): The time in milliseconds to wait for events if
+                there are none. If `negative or `None``, block until there are
+                events.
+            read_delay (int): The time in milliseconds to wait after the first
+                event arrives before reading the buffer. This allows further
+                events to accumulate before reading, which allows the kernel
+                to consolidate like events and can enhance performance when
+                there are many similar events.
+        Returns:
+            list: list of :attr:`~inotify_simple.Event` namedtuples"""
+        # Wait for the first event:
+        pending = self._poller.poll(timeout)
+        if not pending:
+            # Timed out, no events
+            return []
+        if read_delay is not None:
+            # Wait for more events to accumulate:
+            time.sleep(read_delay/1000.0)
+        # How much data is available to read?
+        bytes_avail = ctypes.c_int()
+        ioctl(self.fd, FIONREAD, bytes_avail)
+        buffer_size = bytes_avail.value
+        # Read and parse it:
+        data = os.read(self.fd, buffer_size)
+        events = parse_events(data)
+        return events
+
+    def close(self):
+        """Close the inotify file descriptor"""
+        os.close(self.fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+#: A ``namedtuple`` (wd, mask, cookie, name) for an inotify event.
+#: ``namedtuple`` objects are very lightweight to instantiate and access, whilst
+#: being human readable when printed, which is useful for debugging and
+#: logging. For best performance, note that element access by index is about
+#: four times faster than by name. Note: in Python 2, name is a bytestring,
+#: not a unicode string. In Python 3 it is a string decoded with ``os.fsdecode()``.
+Event = collections.namedtuple('Event', ['wd', 'mask', 'cookie', 'name'])
+
+_EVENT_STRUCT_FORMAT = 'iIII'
+_EVENT_STRUCT_SIZE = struct.calcsize(_EVENT_STRUCT_FORMAT)
+
+
+def parse_events(data):
+    """Parse data read from an inotify file descriptor into list of
+    :attr:`~inotify_simple.Event` namedtuples (wd, mask, cookie, name). This
+    function can be used if you have decided to call ``os.read()`` on the
+    inotify file descriptor yourself, instead of calling
+    :func:`~inotify_simple.INotify.read`.
+    Args:
+        data (bytes): A bytestring as read from an inotify file descriptor
+    Returns:
+        list: list of :attr:`~inotify_simple.Event` namedtuples"""
+    events = []
+    offset = 0
+    buffer_size = len(data)
+    while offset < buffer_size:
+        wd, mask, cookie, namesize = struct.unpack_from(_EVENT_STRUCT_FORMAT, data, offset)
+        offset += _EVENT_STRUCT_SIZE
+        name = _fsdecode(ctypes.c_buffer(data[offset:offset + namesize], namesize).value)
+        offset += namesize
+        events.append(Event(wd, mask, cookie, name))
+    return events
+
+
+class flags(_EnumType):
+    """Inotify flags as defined in ``inotify.h`` but with ``IN_`` prefix
+    omitted. Includes a convenience method for extracting flags from a mask.
+    """
+    ACCESS = 0x00000001  #: File was accessed
+    MODIFY = 0x00000002  #: File was modified
+    ATTRIB = 0x00000004  #: Metadata changed
+    CLOSE_WRITE = 0x00000008  #: Writable file was closed
+    CLOSE_NOWRITE = 0x00000010  #: Unwritable file closed
+    OPEN = 0x00000020  #: File was opened
+    MOVED_FROM = 0x00000040  #: File was moved from X
+    MOVED_TO  = 0x00000080  #: File was moved to Y
+    CREATE = 0x00000100  #: Subfile was created
+    DELETE = 0x00000200  #: Subfile was deleted
+    DELETE_SELF = 0x00000400  #: Self was deleted
+    MOVE_SELF = 0x00000800  #: Self was moved
+
+    UNMOUNT = 0x00002000  #: Backing fs was unmounted
+    Q_OVERFLOW = 0x00004000  #: Event queue overflowed
+    IGNORED = 0x00008000  #: File was ignored
+
+    ONLYDIR = 0x01000000  #: only watch the path if it is a directory
+    DONT_FOLLOW = 0x02000000  #: don't follow a sym link
+    EXCL_UNLINK = 0x04000000  #: exclude events on unlinked objects
+    MASK_ADD = 0x20000000  #: add to the mask of an already existing watch
+    ISDIR = 0x40000000  #: event occurred against dir
+    ONESHOT = 0x80000000  #: only send event once
+
+    @classmethod
+    def from_mask(cls, mask):
+        """Convenience method. Return a list of every flag in a mask."""
+        return [flag for flag in cls.__members__.values() if flag & mask]
+
+class masks(_EnumType):
+    """Convenience masks as defined in ``inotify.h`` but with ``IN_`` prefix
+    omitted."""
+    #: helper event mask equal to ``flags.CLOSE_WRITE | flags.CLOSE_NOWRITE``
+    CLOSE = (flags.CLOSE_WRITE | flags.CLOSE_NOWRITE)
+    #: helper event mask equal to ``flags.MOVED_FROM | flags.MOVED_TO``
+    MOVE = (flags.MOVED_FROM | flags.MOVED_TO)
+
+    #: bitwise-OR of all the events that can be passed to
+    #: :func:`~inotify_simple.INotify.add_watch`
+    ALL_EVENTS  = (flags.ACCESS | flags.MODIFY | flags.ATTRIB | flags.CLOSE_WRITE |
+                   flags.CLOSE_NOWRITE | flags.OPEN | flags.MOVED_FROM |
+                   flags.MOVED_TO | flags.DELETE | flags.CREATE | flags.DELETE_SELF |
+                   flags.MOVE_SELF)
+
+
+# unbuffered
+class Unbuffered(object):
+    """Usage: sys.stdout = Unbuffered(sys.stdout)"""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, data):
+        self.stream.write(data)
+        self.stream.flush()
+
+    def writelines(self, datas):
+        self.stream.writelines(datas)
+        self.stream.flush()
+
+    def __getattr__(self, attr):
+        return getattr(self.stream, attr)
+
+
+# colors
+ANSI_COLORS = [
+    'grey',
+    'red',
+    'green',
+    'yellow',
+    'blue',
+    'magenta',
+    'cyan',
+    'white'
+]
+
+for i, name in enumerate(ANSI_COLORS):
+    globals()[name] = str(30 + i)
+    globals()['intense_' + name] = str(30 + i) + ';1'
+
+
+def get_colors():
+    cs = ['cyan', 'yellow', 'green', 'magenta', 'red', 'blue',
+          'intense_cyan', 'intense_yellow', 'intense_green',
+          'intense_magenta', 'intense_red', 'intense_blue']
+    cs = [globals()[c] for c in cs]
+
+    i = 0
+    while True:
+        yield cs[i % len(cs)]
+        i += 1
+
+
+# utils
+def iteritems(data):
+    return data.iteritems()
+
+
+# env
+class Env(object):
+
+    def now(self):
+        return datetime.datetime.now()
+
+    def terminate(self, pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError as e:
+            if e.errno not in [errno.EPERM, errno.ESRCH]:
+                raise
+
+    def kill(self, pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError as e:
+            if e.errno not in [errno.EPERM, errno.ESRCH]:
+                raise
+
+
+# process
+class Process(object):
+    """
+    A simple utility wrapper around a subprocess.Popen that stores
+    a number of attributes needed by Honcho and supports forwarding process
+    lifecycle events and output to a queue.
+    """
+    def __init__(self,
+                 cmd,
+                 name=None,
+                 color=None,
+                 quiet=False,
+                 env=None,
+                 cwd=None):
+        self.cmd = cmd
+        self.color = color
+        self.quiet = quiet
+        self.name = name
+        self.env = os.environ.copy() if env is None else env
+        self.cwd = cwd
+
+        # This is a honcho.environ.Env object, to allow for stubbing of
+        # external calls, not the operating system environment.
+        self._env = Env()
+        self._child = None
+        self._child_ctor = Popen
+
+    def run(self, events=None, ignore_signals=False):
+        self._events = events
+        self._child = self._child_ctor(self.cmd, env=self.env, cwd=self.cwd)
+        self._send_message({'pid': self._child.pid}, type='start')
+
+        # Don't pay attention to SIGINT/SIGTERM. The process itself is
+        # considered unkillable, and will only exit when its child (the shell
+        # running the Procfile process) exits.
+        if ignore_signals:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+        for line in iter(self._child.stdout.readline, b''):
+            if not self.quiet:
+                self._send_message(line)
+        self._child.stdout.close()
+        self._child.wait()
+
+        self._send_message({'returncode': self._child.returncode}, type='stop')
+
+    def _send_message(self, data, type='line'):
+        if self._events is not None:
+            self._events.put(Message(type=type,
+                                     data=data,
+                                     time=self._env.now(),
+                                     name=self.name,
+                                     color=self.color))
+
+
+class Popen(subprocess.Popen):
+
+    def __init__(self, cmd, **kwargs):
+        start_new_session = kwargs.pop('start_new_session', True)
+        options = {
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.STDOUT,
+            'shell': True,
+            'bufsize': 1,
+            'close_fds': True,
+        }
+        options.update(**kwargs)
+        if start_new_session:
+            if sys.version_info < (3, 2):
+                options.update(preexec_fn=os.setsid)
+            else:
+                options.update(start_new_session=True)
+        super(Popen, self).__init__(cmd, **options)
+
+
+# printer
+Message = namedtuple("Message", "type data time name color")
+
+
+class Printer(object):
+    """
+    Printer is where Honcho's user-visible output is defined. A Printer
+    instance receives typed messages and prints them to its output (usually
+    STDOUT) in the Honcho format.
+    """
+
+    def __init__(self,
+                 output=sys.stdout,
+                 time_format="%H:%M:%S",
+                 width=0,
+                 color=True,
+                 prefix=True):
+        self.output = output
+        self.time_format = time_format
+        self.width = width
+        self.color = color
+        self.prefix = prefix
+
+        try:
+            # We only want to print colored messages if the given output supports
+            # ANSI escape sequences. Usually, testing if it is a TTY is safe enough.
+            self._colors_supported = self.output.isatty()
+        except AttributeError:
+            # If the given output does not implement isatty(), we assume that it
+            # is not able to handle ANSI escape sequences.
+            self._colors_supported = False
+
+    def write(self, message):
+        if message.type != 'line':
+            raise RuntimeError('Printer can only process messages of type "line"')
+
+        name = message.name if message.name is not None else ""
+        name = name.ljust(self.width)
+        if name:
+            name += " "
+
+        # When encountering data that cannot be interpreted as UTF-8 encoded
+        # Unicode, Printer will replace the unrecognisable bytes with the
+        # Unicode replacement character (U+FFFD).
+        if isinstance(message.data, bytes) or isinstance(message.data, unicode):
+            string = message.data.decode("utf-8", "replace")
+        else:
+            string = message.data
+
+        # TODO (AC): fix unicode/bytes py27 mess in restch & dnr
+        nl = str('\n')
+        for line in string.splitlines():
+            buf = line.encode('utf-8') + nl
+            sys.stderr.write(buf)
+
+        # for line in string.splitlines():
+        #     # prefix = ''
+        #     # if self.prefix:
+        #     #     time_formatted = message.time.strftime(self.time_format)
+        #     #     # prefix = '{time} {name}| '.format(time=time_formatted, name=name)
+        #     #     prefix = '{name}| '.format(time=time_formatted, name=name)
+        #     #     if self.color and self._colors_supported and message.color:
+        #     #         prefix = _color_string(message.color, prefix)
+        #     # if message.name == '':
+        #     #     prefix = ''
+        #     self.output.write(prefix + line + '\n')
+
+
+def _ansi(code):
+    return '\033[{0}m'.format(code)
+
+
+def _color_string(color, s):
+    return '{0}{1}{2}{3}'.format(_ansi(0), _ansi(color), s, _ansi(0))
+
+
+# proc_manager
+KILL_WAIT = 5
+SIGNALS = {
+    signal.SIGINT: {
+        'name': 'SIGINT',
+        'rc': 130,
+    },
+    signal.SIGTERM: {
+        'name': 'SIGTERM',
+        'rc': 143,
+    },
+}
+SYSTEM_PRINTER_NAME = 'restch'
+
+
+class Manager(object):
+    """
+    Manager is responsible for running multiple external processes in parallel
+    managing the events that result (starting, stopping, printing). By default
+    it relays printed lines to a printer that prints to STDOUT.
+
+    Example::
+
+        import sys
+        from honcho.manager import Manager
+
+        m = Manager()
+        m.add_process('server', 'ruby server.rb')
+        m.add_process('worker', 'python worker.py')
+        m.loop()
+
+        sys.exit(m.returncode)
+    """
+
+    #: After :func:`~honcho.manager.Manager.loop` finishes,
+    #: this will contain a return code that can be used with `sys.exit`.
+    returncode = None
+
+    stop_requested = False
+
+    def __init__(self, need_restart, printer):
+        self.events = multiprocessing.Queue()
+        self.stop_requested = False
+        self.returncode = None
+        self._colors = get_colors()
+        self._env = Env()
+        self._need_restart = need_restart
+        self._printer = printer
+        self._process_ctor = Process
+        self._processes = {}
+        self._exit_start = None
+        self._terminating = False
+
+    def add_process(self, name, cmd, quiet=False, env=None, cwd=None):
+        """
+        Add a process to this manager instance. The process will not be started
+        until :func:`~honcho.manager.Manager.loop` is called.
+        """
+        assert name not in self._processes, "process names must be unique"
+        proc = self._process_ctor(cmd,
+                                  name=name,
+                                  quiet=quiet,
+                                  color=next(self._colors),
+                                  env=env,
+                                  cwd=cwd)
+        self._processes[name] = {}
+        self._processes[name]['obj'] = proc
+
+        # Update printer width to accommodate this process name
+        self._printer.width = max(self._printer.width, len(name))
+
+        return proc
+
+    def loop(self):
+        """
+        Start all the added processes and multiplex their output onto the bound
+        printer (which by default will print to STDOUT).
+
+        If one process terminates, all the others will be terminated by
+        Honcho, and :func:`~honcho.manager.Manager.loop` will return.
+
+        This method will block until all the processes have terminated.
+        """
+
+        self._start()
+
+        exit = False
+        restart_start = None
+        while True:
+            need_restart = self._need_restart()
+            # evs = self._inotify.read(timeout=0.1)
+            # if [] != evs:
+            #     for ev in evs:
+            #         for f in flags.from_mask(ev.mask):
+            #             need_restart += f == flags.MODIFY
+            if need_restart and self._all_started():
+                if restart_start is None:
+                    restart_start = self._env.now()
+                    self._system_print('modifications detected, stopping children processes...')
+                    self.terminate()
+                else:
+                    self._system_print('modifications detected while in the restart state, skip this time.')
+            try:
+                msg = self.events.get(timeout=0.05)
+            except Empty:
+                if exit:
+                    break
+            else:
+                if msg.type == 'line':
+                    self._printer.write(msg)
+                elif msg.type == 'start':
+                    self._processes[msg.name]['pid'] = msg.data['pid']
+                    self._system_print("restch child process %s started\n" % (msg.data['pid'], ))
+                elif msg.type == 'stop':
+                    self._processes[msg.name]['returncode'] = msg.data['returncode']
+                    self._system_print("restch child process stopped (rc=%s)\n" % (msg.data['returncode'], ))
+                    if self.returncode is None:
+                        self.returncode = msg.data['returncode']
+
+            if self._all_started() and self._all_stopped():
+                exit = True
+
+            if self._exit_start is None and self._all_started() and self._any_stopped():
+                self.terminate()
+
+            if self._exit_start is not None:
+                # If we've been in this loop for more than KILL_WAIT seconds,
+                # it's time to kill all remaining children.
+                waiting = self._env.now() - self._exit_start
+                if waiting > datetime.timedelta(seconds=KILL_WAIT):
+                    self.kill()
+        return restart_start is not None
+
+    def terminate(self):
+        """Terminate all processes managed by this process Manager."""
+        if self._terminating:
+            return
+        self._exit_start = self._env.now()
+        self._terminating = True
+        self._killall()
+
+    def kill(self):
+        """Kill all processes managed by this process Manager."""
+        self._killall(force=True)
+
+    def _killall(self, force=False):
+        """Kill all remaining processes, forcefully if requested."""
+        for_termination = []
+
+        for n, p in iteritems(self._processes):
+            if 'returncode' not in p:
+                for_termination.append(n)
+
+        for n in for_termination:
+            p = self._processes[n]
+            signame = 'SIGKILL' if force else 'SIGTERM'
+            self._system_print("sending %s to %s (pid %s)\n" %
+                               (signame, n, p['pid']))
+            if force:
+                self._env.kill(p['pid'])
+            else:
+                self._env.terminate(p['pid'])
+
+    def _start(self):
+        for name, p in self._processes.items():
+            p['process'] = multiprocessing.Process(name=name,
+                                                   target=p['obj'].run,
+                                                   args=(self.events, True))
+            p['process'].start()
+
+    def _all_started(self):
+        return all(p.get('pid') is not None for _, p in iteritems(self._processes))
+
+    def _all_stopped(self):
+        return all(p.get('returncode') is not None for _, p in iteritems(self._processes))
+
+    def _any_stopped(self):
+        return any(p.get('returncode') is not None for _, p in iteritems(self._processes))
+
+    def _system_print(self, data):
+        self._printer.write(Message(type='line',
+                                    data=data.strip(),
+                                    time=self._env.now(),
+                                    name=SYSTEM_PRINTER_NAME,
+                                    color=None))
+
+# proc_utils
+class TimeoutExpired(Exception):
+    pass
+
+
+def pid_exists(pid):
+    if pid < 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    else:
+        return True
+
+
+def wait_pid(pid, timeout=None):
+    def check_timeout(delay):
+        if timeout is not None:
+            if time.time() >= stop_at:
+                raise TimeoutExpired
+        time.sleep(delay)
+        return min(delay * 2, 0.04)
+
+    if timeout is not None:
+        waitcall = lambda: os.waitpid(pid, os.WNOHANG)
+        stop_at = time.time() + timeout
+    else:
+        waitcall = lambda: os.waitpid(pid, 0)
+
+    delay = 0.0001
+    while 1:
+        try:
+            retpid, status = waitcall()
+        except OSError as err:
+            if err.errno == errno.EINTR:
+                delay = check_timeout(delay)
+                continue
+            elif err.errno == errno.ECHILD:
+                # This has two meanings:
+                # - pid is not a child of os.getpid() in which case
+                #   we keep polling until it's gone
+                # - pid never existed in the first place
+                # In both cases we'll eventually return None as we
+                # can't determine its exit status code.
+                while 1:
+                    if pid_exists(pid):
+                        delay = check_timeout(delay)
+                    else:
+                        return
+            else:
+                raise
+        else:
+            if retpid == 0:
+                # WNOHANG was used, pid is still running
+                delay = check_timeout(delay)
+                continue
+            # process exited due to a signal; return the integer of
+            # that signal
+            if os.WIFSIGNALED(status):
+                return os.WTERMSIG(status)
+            # process exited using exit(2) system call; return the
+            # integer exit(2) system call has been called with
+            elif os.WIFEXITED(status):
+                return os.WEXITSTATUS(status)
+            else:
+                # should never happen
+                raise RuntimeError("unknown process exit status")
+
+
+# main
+def puts(*args):
+    print('restsh:', *args)
+
+
+def parse_args_exit(msg):
+    puts(msg)
+    sys.exit(-1)
+
+
+def queue_arg_if_needed(x):
+    if ' ' in x:
+        return '"' + x + '"'; 
+    return x
+
+
+def quote_args_if_needed(xs):
+    return [queue_arg_if_needed(x) for x in xs]
+
+
+def parse_args(xs):
+    if len(xs) == 0:
+        return parse_args_exit('usage: restch [-h] PATTERN [PATTERN ...] -- CMD')
+    if filter(lambda x: x == '--', xs) != ['--']:
+        return parse_args_exit('error: "--" is required.')
+    return {
+        'paths': ['' + x for x in xs[:xs.index('--')]],
+        'command': ' '.join(quote_args_if_needed(xs[xs.index('--')+1:]))
+    }
+
+
+def create_poller(inotify, timeout=0.05):
+
+    def fn():
+        need_restart = 0
+        evs = inotify.read(timeout=timeout)
+        if [] != evs:
+            for ev in evs:
+                for f in flags.from_mask(ev.mask):
+                    need_restart += f == flags.MODIFY
+        return need_restart != 0
+
+    return fn
+
+
+def main():
+    sys.stdout = Unbuffered(sys.stdout)
+    sys.stderr = Unbuffered(sys.stderr)
+    
+    args = parse_args(sys.argv[1:])
+    
+    for path in args['paths']:
+        if not os.path.exists(path):
+            puts('error: %s file does not exists' % path)
+            sys.exit(-1)
+
+    printer = Printer(sys.stdout)
+    printer.width = len(SYSTEM_PRINTER_NAME)
+
+    inotify = INotify()
+    for path in args['paths']:
+        inotify.add_watch(path, flags.CREATE | flags.DELETE | flags.MODIFY | flags.DELETE_SELF)
+        printer.write(Message(
+            type='line', 
+            data='Watching %s file...' % path, 
+            time=Env().now(), 
+            name=SYSTEM_PRINTER_NAME,
+            color=False))
+
+    need_restart_fn = create_poller(inotify)
+
+    mgr = [None]
+    stop_requested = [False]
+
+    def signal_handler_terminate(signum, frame):
+        printer.write(Message(
+            type='line', 
+            data="%s received\n" % SIGNALS[signum]['name'], 
+            time=Env().now(), 
+            name=SYSTEM_PRINTER_NAME,
+            color=False))
+        mgr[0].returncode = SIGNALS[signum]['rc']
+        mgr[0].stop_requested = True
+        stop_requested[0] = True
+        mgr[0].terminate()
+
+    signal.signal(signal.SIGTERM, signal_handler_terminate)
+    signal.signal(signal.SIGINT, signal_handler_terminate)
+
+    while True:
+        m = Manager(need_restart_fn, printer)
+        mgr[0] = m
+        m.add_process('', args['command'])
+        immediate_restart = m.loop()
+        if m.stop_requested:
+            return m.returncode
+        if immediate_restart:
+            continue
+        printer.write(Message(
+                    type='line', 
+                    data='Watching %s file...' % path, 
+                    time=Env().now(), 
+                    name=SYSTEM_PRINTER_NAME,
+                    color=False))            
+        while True:
+            if stop_requested[0]:
+                return 0
+            if need_restart_fn():
+                break
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
