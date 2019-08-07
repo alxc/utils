@@ -10,6 +10,7 @@ import errno
 import multiprocessing
 import os
 import io
+import random
 import re
 import os.path
 import select
@@ -909,7 +910,7 @@ def main():
     # apply shadow argument
     if args_shadow:
         src_netcoreapp_dir_path = os.path.abspath(os.path.join(dll_path, '..'))
-        dst_netcoreapp_dir_path = src_netcoreapp_dir_path + ('-sc%s' % int(time.time()))
+        dst_netcoreapp_dir_path = src_netcoreapp_dir_path + ('-sc%s%s' % (int(time.time()), random.randint(1111, 9999)))
         shutil.copytree(src_netcoreapp_dir_path + '/', dst_netcoreapp_dir_path + '/')
         final_dll_path = os.path.join(dst_netcoreapp_dir_path, dll_filename)
     else:
