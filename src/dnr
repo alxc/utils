@@ -467,7 +467,7 @@ def _color_string(color, s):
 
 
 # proc_manager
-KILL_WAIT = 5
+KILL_WAIT = int(os.environ.get('KILL_WAIT', 30))
 SIGNALS = {
     signal.SIGINT: {
         'name': 'SIGINT',

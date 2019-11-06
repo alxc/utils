@@ -62,7 +62,7 @@ except ImportError:
 else:
     # If the user passes a Path object it will be converted to bytes:
     _fsencode = lambda s: bytes(s) if isinstance(s, pathlib.Path) else s.encode(_fsencoding)
-    
+
 # And we will not decode bytestrings in inotify events, we will simply
 # give the user bytestrings back:
 _fsdecode = lambda s: s
@@ -473,7 +473,7 @@ def _color_string(color, s):
 
 
 # proc_manager
-KILL_WAIT = 5
+KILL_WAIT = int(os.environ.get('KILL_WAIT', 30))
 SIGNALS = {
     signal.SIGINT: {
         'name': 'SIGINT',
@@ -740,7 +740,7 @@ def parse_args_exit(msg):
 
 def queue_arg_if_needed(x):
     if ' ' in x:
-        return '"' + x + '"'; 
+        return '"' + x + '"';
     return x
 
 
@@ -776,9 +776,9 @@ def create_poller(inotify, timeout=0.05):
 def main():
     sys.stdout = Unbuffered(sys.stdout)
     sys.stderr = Unbuffered(sys.stderr)
-    
+
     args = parse_args(sys.argv[1:])
-    
+
     for path in args['paths']:
         if not os.path.exists(path):
             puts('error: %s file does not exists' % path)
@@ -791,9 +791,9 @@ def main():
     for path in args['paths']:
         inotify.add_watch(path, flags.CREATE | flags.DELETE | flags.MODIFY | flags.DELETE_SELF)
         printer.write(Message(
-            type='line', 
-            data='Watching %s file...' % path, 
-            time=Env().now(), 
+            type='line',
+            data='Watching %s file...' % path,
+            time=Env().now(),
             name=SYSTEM_PRINTER_NAME,
             color=False))
 
@@ -804,9 +804,9 @@ def main():
 
     def signal_handler_terminate(signum, frame):
         printer.write(Message(
-            type='line', 
-            data="%s received\n" % SIGNALS[signum]['name'], 
-            time=Env().now(), 
+            type='line',
+            data="%s received\n" % SIGNALS[signum]['name'],
+            time=Env().now(),
             name=SYSTEM_PRINTER_NAME,
             color=False))
         mgr[0].returncode = SIGNALS[signum]['rc']
@@ -827,11 +827,11 @@ def main():
         if immediate_restart:
             continue
         printer.write(Message(
-                    type='line', 
-                    data='Watching %s file...' % path, 
-                    time=Env().now(), 
+                    type='line',
+                    data='Watching %s file...' % path,
+                    time=Env().now(),
                     name=SYSTEM_PRINTER_NAME,
-                    color=False))            
+                    color=False))
         while True:
             if stop_requested[0]:
                 return 0

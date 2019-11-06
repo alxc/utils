@@ -3,15 +3,20 @@
 from __future__ import print_function, unicode_literals
 
 import sys
+import os
 import json
 import colorama
+import honcho.manager
 from honcho.manager import Manager
 
-
-EXCLUDE = ['assemblyName', 'globalContext', 'callTime', 'logRoute', 'sourceContext']
+EXCLUDE_DEFAULT = 'assemblyName,globalContext,callTime,logRoute,sourceContext,params,hostname'
+EXCLUDE = [x.strip() for x in os.environ.get('PRETTY_EXCLUDE', EXCLUDE_DEFAULT).split(',') if x.strip() > '']
 DUMP_TO_FILE = False
 COLORED = True and not DUMP_TO_FILE
 MAX_COLS = 240
+
+
+honcho.manager.KILL_WAIT = int(os.environ.get('KILL_WAIT', 30))
 
 
 class Unbuffered(object):
@@ -59,7 +64,7 @@ def colored(color):
 
     if COLORED:
         return fn
-    
+
     return unicode
 
 
@@ -145,8 +150,8 @@ def render_string(string):
         b += render_exception(dct[F_EXCEPTION])
     if F_EXCEPTIONS in dct:
         b += render_exceptions(dct[F_EXCEPTIONS])
-    fields = ''   
-    ml_fields = ''   
+    fields = ''
+    ml_fields = ''
     for k, v in sorted(d.iteritems()):
         tv = type(v)
         if tv in [unicode, str] and '\n' in v:
@@ -165,7 +170,7 @@ def render_string(string):
                 cv = json.dumps(v)
             elif tv == list:
                 cv = json.dumps(v)
-            else: 
+            else:
                 cv = unicode(v)
             l = field_color(k) + dark_gray(':')
             fields += l + ' ' + cv + ' '
