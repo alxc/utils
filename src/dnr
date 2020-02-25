@@ -683,7 +683,7 @@ def discover_env_path(cs_proj_dir_path):
 
 def discover_latest_netcoreapp(path):
     """`path` should point to the directory containing `netcoreapp2*` directory, usually it is .../bin/Debug/"""
-    for x in ['netcoreapp2.2', 'netcoreapp2.1', 'netcoreapp2.0']:
+    for x in ['netcoreapp3.1', 'netcoreapp3.0', 'netcoreapp2.2', 'netcoreapp2.1', 'netcoreapp2.0']:
         if os.path.exists(os.path.join(path, x)):
             return x
     return 'netcoreapp2.0'

@@ -15,6 +15,9 @@ install:
 	rm $(HOME)/.local/bin/pretty > /dev/null 2>&1 || true
 	ln -s $(shell realpath ./src/pretty) ${HOME}/.local/bin/pretty || true
 
+	rm $(HOME)/.local/bin/make-screenshot-area > /dev/null 2>&1 || true
+	ln -s $(shell realpath ./src/make-screenshot-area) ${HOME}/.local/bin/make-screenshot-area || true
+
 	pip install honcho==1.0.1 --user
 
 	echo 'import os; KILL_WAIT = int(os.environ.get("KILL_WAIT", 60))' >> $(HOME)/.local/lib/python2.7/site-packages/honcho/manager.py

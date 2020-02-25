@@ -1,0 +1,23 @@
+#!/bin/bash
+DP="/tmp/screenshots"
+rm -rf $DP || true
+mkdir -p $DP
+cd /tmp/screenshots
+SFN="scs$(date +%s)$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 4 | head -n 1).png"
+FFN="$DP/$SFN"
+rm $FFN > /dev/null 2>&1 || true
+DISPLAY=:0.0 gnome-screenshot --border-effect=none --file="$FFN" --area > /dev/null 2>&1
+if [ "$?" == "1" ]; then
+    killall -9 gnome-screenshot
+    DISPLAY=:0.0 gnome-screenshot --border-effect=none --file="$FFN" --area > /dev/null 2>&1
+fi
+if [ "$?" == "1" ]; then
+    notify-send "gnome-screenshot failed"
+    exit 0
+fi
+fi
+if [ -f "$FFN" ]; then
+    echo "Saving $FFN file..."
+    aws s3 cp --acl public-read $FFN s3://alxc/1/
+    LONG_URI="https://alxc.s3.amazonaws.com/1/$SFN" && echo "$LONG_URI" | xclip -selection clipboard && notify-send "Screenshot: $LONG_URI"
+fi
