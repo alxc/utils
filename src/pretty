@@ -1,7 +1,7 @@
 #!/usr/bin/python2.7 -u
 # -*- coding: UTF-8 -*-
 from __future__ import print_function, unicode_literals
-
+import re
 import sys
 import os
 import json
@@ -121,22 +121,34 @@ def render_exceptions(xs):
     return s
 
 
-def render_multiline(level, x):
+def render_multiline(level, x, prefix=''):
     b, f = '', levels[level]
     for l in x.splitlines():
-        b += level_clr[level](f) + dark_gray('|') + l + '\n'
+        b += prefix + level_clr[level](f) + dark_gray('|') + l + '\n'
         f = '|'
     return b
 
 
-def render_string(string):
-    #return string
+does_it_look_like_docker_compose = re.compile(r'^(\x1b\[\d\d\w\S+\s+\|\x1b\[0m\s)')
+
+def render_string(val):
+    #return val
+    prefix = ''
+    is_it_docker_compose = does_it_look_like_docker_compose.match(val)
+    if is_it_docker_compose is not None:
+        prefix = is_it_docker_compose.groups(1)[0]
+        string = val[len(prefix):]
+    else:
+        string = val
     try:
-        dct = json.loads(string)  # type: dict
+        if string.startswith('{'):
+            dct = json.loads(string)  # type: dict
+        else:
+            dct = None
     except:
         dct = None
     if type(dct) is not dict:
-        return dark_gray('||') + string
+        return prefix + dark_gray('||') + string
     d = dct.copy()
     if F_MESSAGE in d: del d[F_MESSAGE]
     if F_LEVEL in d: del d[F_LEVEL]
@@ -145,6 +157,8 @@ def render_string(string):
     [d.pop(k, None) for k in EXCLUDE]
     level = dct.get(F_LEVEL, '(nil)').lower()
     message = dct.get(F_MESSAGE, '(nil:message)').strip()
+    if not level in level_clr:
+        return prefix + dark_gray('||') + string
     b = (level_clr[level](message) + ' ' + dark_gray(dct.get(F_SOURCE_CONTEXT, ''))).strip() + '\n'
     if F_EXCEPTION in dct:
         b += render_exception(dct[F_EXCEPTION])
@@ -178,7 +192,7 @@ def render_string(string):
         b += '  ' + fields
     if ml_fields != '':
         b += '\n' + ml_fields
-    return render_multiline(level, b)
+    return render_multiline(level, b, prefix)
 
 
 class Printer():
