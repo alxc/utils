@@ -2,6 +2,7 @@
 DP="/tmp/screenshots"
 rm -rf $DP || true
 mkdir -p $DP
+mkdir -p ~/Temp/Screenshots
 cd /tmp/screenshots
 SFN="scs$(date +%s)$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 4 | head -n 1).png"
 FFN="$DP/$SFN"
@@ -15,9 +16,9 @@ if [ "$?" == "1" ]; then
     notify-send "gnome-screenshot failed"
     exit 0
 fi
-fi
 if [ -f "$FFN" ]; then
     echo "Saving $FFN file..."
+    cp $FFN ~/Temp/Screenshots || true
     aws s3 cp --acl public-read $FFN s3://alxc/1/
     LONG_URI="https://alxc.s3.amazonaws.com/1/$SFN" && echo "$LONG_URI" | xclip -selection clipboard && notify-send "Screenshot: $LONG_URI"
 fi
