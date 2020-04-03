@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# usage: curl -A "Mozilla/5.0" -L https://raw.githubusercontent.com/alxc/utils/master/get-utils | bash
+# usage: curl -A "Mozilla/5.0" -Ls https://raw.githubusercontent.com/alxc/utils/master/get-utils | bash
 
 set -ex
 
