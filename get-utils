@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+# usage: curl -A "Mozilla/5.0" -L https://raw.githubusercontent.com/alxc/utils/master/get-utils | bash
+
+set -ex
+
+curl -A "Mozilla/5.0" -L https://raw.githubusercontent.com/alxc/utils/master/LICENSE
+
+rm -rf $HOME/.local/share/alxc/utils
+mkdir -p $HOME/.local/share/alxc
+cd $HOME/.local/share/alxc
+git clone git@github.com:alxc/utils.git
+cd utils
+make install

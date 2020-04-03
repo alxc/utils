@@ -825,9 +825,11 @@ def main():
     if launch_settings_path is None:
         print('dnr: could not find launchSettings.json, no enviroment variables will be set')
     else:
-        with io.open(launch_settings_path) as f:
+        with io.open(launch_settings_path, 'r', encoding='utf-8') as f:
             try:
-                json_text = '\n'.join([x for x in f.readlines() if x.strip() != '' and not x.strip().startswith('//') ])
+                #json_text = '\n'.join([x for x in f.readlines() if x.strip() != '' and not x.strip().startswith('//') ])
+                json_text = f.read()
+                print('json_text', json_text)
                 launch_settings = json.loads(json_text)
             except:
                 print('dnr: error: failed to parse {} file.'.format(launch_settings_path))
