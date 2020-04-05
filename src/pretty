@@ -9,7 +9,7 @@ import colorama
 import honcho.manager
 from honcho.manager import Manager
 
-EXCLUDE_DEFAULT = 'assemblyName,globalContext,callTime,logRoute,sourceContext,params,hostname'
+EXCLUDE_DEFAULT = 'assemblyName,globalContext,callTime,logRoute,sourceContext,params,hostname,appName,context,props,service,timestamp'
 EXCLUDE = [x.strip() for x in os.environ.get('PRETTY_EXCLUDE', EXCLUDE_DEFAULT).split(',') if x.strip() > '']
 DUMP_TO_FILE = False
 COLORED = True and not DUMP_TO_FILE
@@ -105,6 +105,8 @@ F_SOURCE_CONTEXT = 'sourceContext'
 def render_exception(x):
     if type(x) != dict:
         return unicode(x)
+    if x.get('message', '') == '' and x.get('type', '') == '':
+        return ''
     s = ''
     s += ' * exception: %s\n' % (x.get('message', '(nil)'), )
     s += '   - type: %s\n' % (x.get('type', '(nil)'), )
