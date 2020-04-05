@@ -177,7 +177,9 @@ def render_string(val):
             ml_fields += dark_gray('```') + '\n'
         else:
             if v is None:
-                cv = light_blue('null')
+                continue
+            elif tv in [unicode, str] and v == '':
+                continue
             elif tv in [unicode, str]:
                 cv = light_yellow('\'' + v + '\'')
             elif tv in [int, float, bool]:
