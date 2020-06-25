@@ -9,6 +9,6 @@ curl -A "Mozilla/5.0" -L https://raw.githubusercontent.com/alxc/utils/master/LIC
 rm -rf $HOME/.local/share/alxc/utils
 mkdir -p $HOME/.local/share/alxc
 cd $HOME/.local/share/alxc
-git clone git@github.com:alxc/utils.git
+git clone git clone https://github.com/alxc/utils.git
 cd utils
 make install
