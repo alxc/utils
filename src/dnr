@@ -901,8 +901,12 @@ def main():
     dump_vars = 'Configuration variables:'
     for k, v in sorted(ls_vars.items()):
         sk, sv = str(k), str(final_vars[k]).strip('"')
+        env_key = '__'.join([x.upper() for x in sk.split(':')])
+        env_val = os.environ.get(env_key, None)
+        if env_val is not None:
+            sv = env_val
         sv_short = sv.split('\n')[0] if '\n' in sv else sv
-        dump_vars += '\n  - {0} = {1}'.format(sk, sv_short)
+        dump_vars += '\n  - {0} = {1}'.format(sk, sv_short + ('' if env_val is None else '    # environment variable'))
         env[sk.replace(":", "__")] = sv
     dump_vars += '\n'
     printer.write(Message(type='line', data=dump_vars, time=Env().now(), name=SYSTEM_PRINTER_NAME, color=None))
@@ -918,6 +922,7 @@ def main():
 
     # launch program
     m = Manager(printer)
+    printer.write(Message(type='line', data='dnr %s' % (final_dll_path, ), time=Env().now(), name=SYSTEM_PRINTER_NAME, color=None))
     m.add_process(dll_filename, '/usr/share/dotnet/dotnet ' + final_dll_path, env=env, cwd=cs_proj_dir_path)
     m.loop()
 
