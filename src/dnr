@@ -732,7 +732,7 @@ def vault_token():
 def vault_read(path):
     try:
         url_base = os.environ.get('VAULT_ADDR', 'http://localhost:8200').strip('/')
-        url = '{}/v1/secret/{}'.format(url_base, path)
+        url = '{}/v1/{}'.format(url_base, path)
         print('Reading "{}" key...'.format(url))
         headers = { 'Content-type': 'application/json', 'Accept': 'application/json', 'X-Vault-Token': vault_token() }
         req = urllib2.Request(url=url, headers=headers)
@@ -850,6 +850,7 @@ def main():
     if env_config_path is None:
         print('dnr: could not find dnr.env file, it will use values specified in the launchSettings.json')
     else:
+        print('dnr: using config %s' % (env_config_path, ))
         with io.open(env_config_path) as f:
             content = f.readlines()
             content.append(u'\n')
@@ -914,7 +915,7 @@ def main():
     # apply shadow argument
     if args_shadow:
         src_netcoreapp_dir_path = os.path.abspath(os.path.join(dll_path, '..'))
-        dst_netcoreapp_dir_path = src_netcoreapp_dir_path + ('-sc%s%s' % (int(time.time()), random.randint(1111, 9999)))
+        dst_netcoreapp_dir_path = src_netcoreapp_dir_path + ('-sc%x%x' % (int(time.time()), random.randint(1111, 9999)))
         shutil.copytree(src_netcoreapp_dir_path + '/', dst_netcoreapp_dir_path + '/')
         final_dll_path = os.path.join(dst_netcoreapp_dir_path, dll_filename)
     else:
@@ -922,7 +923,7 @@ def main():
 
     # launch program
     m = Manager(printer)
-    printer.write(Message(type='line', data='dnr %s' % (final_dll_path, ), time=Env().now(), name=SYSTEM_PRINTER_NAME, color=None))
+    printer.write(Message(type='line', data='dnr: %s' % (final_dll_path.replace(os.environ['HOME'], '~'), ), time=Env().now(), name=SYSTEM_PRINTER_NAME, color=None))
     m.add_process(dll_filename, '/usr/share/dotnet/dotnet ' + final_dll_path, env=env, cwd=cs_proj_dir_path)
     m.loop()
 
