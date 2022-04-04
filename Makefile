@@ -20,5 +20,5 @@ install:
 
 	pip install honcho==1.0.1 colorama==0.3.9 --user
 
-	echo 'import os; KILL_WAIT = int(os.environ.get("KILL_WAIT", 60))' >> $(HOME)/.local/lib/python2.7/site-packages/honcho/manager.py
-	rm $(HOME)/.local/lib/python2.7/site-packages/honcho/manager.pyc > /dev/null 2>&1 || true
+	echo 'import os; KILL_WAIT = int(os.environ.get("KILL_WAIT", 60))' >> $(HOME)/.local/lib/python3.8/site-packages/honcho/manager.py
+	rm $(HOME)/.local/lib/python3.8/site-packages/honcho/manager.pyc > /dev/null 2>&1 || true
